@@ -16,7 +16,7 @@ env:
   DATA_SOURCE: dukascopy    # chart se exact match chahiye to: tradingview
   INTERVAL: 15m
   LABEL: EURUSD
-  TIMEZONE: Asia/Kolkata
+  TIMEZONE: UTC
 
 jobs:
   run:
