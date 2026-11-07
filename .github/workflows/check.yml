@@ -1,0 +1,37 @@
+name: Check vs TradingView chart
+
+# Manual: last signals + active boxes print karta hai (mail nahi bhejta, state nahi badalta)
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Data source"
+        type: choice
+        options: [dukascopy, tradingview]
+        default: dukascopy
+      symbol:
+        description: "Symbol"
+        type: choice
+        options: [ALL, EURUSD, GBPUSD, USDJPY, BTCUSD, ETHUSD]
+        default: ALL
+      count:
+        description: "Kitne last events"
+        default: "10"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - if: inputs.source == 'tradingview'
+        run: pip install git+https://github.com/rongardF/tvdatafeed.git
+      - run: python indicator.py check ${{ inputs.count }} ${{ inputs.symbol }}
+        env:
+          DATA_SOURCE: ${{ inputs.source }}
+          INTERVAL: 15m
+          TIMEZONE: Asia/Kolkata
