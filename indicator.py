@@ -1,8 +1,8 @@
 """UNKOWN BADSHA - Volume Order Block indicator (Pine v5 -> Python), EURUSD 15m.
 
 Run modes:
-  python indicator.py          -> naye signals email karo (state.json se duplicate roke)
-  python indicator.py check 10 -> last 10 signals + active boxes print karo (chart se match karne ke liye)
+  python indicator.py                  -> sab symbols ke naye signals email karo (state.json se duplicate roke)
+  python indicator.py check 10 [SYM]   -> last 10 signals + active boxes print karo (chart se match karne ke liye)
 """
 import json
 import os
@@ -20,16 +20,22 @@ import requests
 
 # ---- Settings (env se override) ---------------------------------------------
 DATA_SOURCE = os.getenv("DATA_SOURCE", "dukascopy")   # dukascopy | tradingview
-LABEL = os.getenv("LABEL", "EURUSD")
+SYMBOLS = [x.strip().upper() for x in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD").split(",") if x.strip()]
 INTERVAL = os.getenv("INTERVAL", "15m")               # 5m | 15m | 30m
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "15"))
 LENGTH = int(os.getenv("LENGTH", "5"))                # Volume Pivot Length
 MITIGATION = os.getenv("MITIGATION", "Wick")          # Wick | Close
 EXT_LAST = int(os.getenv("EXT_LAST", "3"))            # chart par kitne box dikhte hain
-DEC = int(os.getenv("PRICE_DECIMALS", "5"))
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))  # mail ka time is timezone mein
-TV_SYMBOL = os.getenv("TV_SYMBOL", "EURUSD")
-TV_EXCHANGE = os.getenv("TV_EXCHANGE", "FXCM")
+
+# Har symbol: Dukascopy instrument, TradingView (symbol, exchange), price decimals
+PAIRS = {
+    "EURUSD": dict(dk="INSTRUMENT_FX_MAJORS_EUR_USD", tv=("EURUSD", "FXCM"), dec=5),
+    "GBPUSD": dict(dk="INSTRUMENT_FX_MAJORS_GBP_USD", tv=("GBPUSD", "FXCM"), dec=5),
+    "USDJPY": dict(dk="INSTRUMENT_FX_MAJORS_USD_JPY", tv=("USDJPY", "FXCM"), dec=3),
+    "BTCUSD": dict(dk="INSTRUMENT_VCCY_BTC_USD", tv=("BTCUSD", "BITSTAMP"), dec=2),
+    "ETHUSD": dict(dk="INSTRUMENT_VCCY_ETH_USD", tv=("ETHUSD", "BITSTAMP"), dec=2),
+}
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
@@ -121,35 +127,35 @@ def _norm(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_dukascopy() -> pd.DataFrame:
+def fetch_dukascopy(sym: str) -> pd.DataFrame:
     import dukascopy_python as dk
-    from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_EUR_USD
+    from dukascopy_python import instruments as ins
 
     iv = {"5m": dk.INTERVAL_MIN_5, "15m": dk.INTERVAL_MIN_15, "30m": dk.INTERVAL_MIN_30}[INTERVAL]
     end = datetime.now(timezone.utc).replace(tzinfo=None)
     start = end - timedelta(days=LOOKBACK_DAYS)
-    return _norm(dk.fetch(INSTRUMENT_FX_MAJORS_EUR_USD, iv, dk.OFFER_SIDE_BID, start, end))
+    return _norm(dk.fetch(getattr(ins, PAIRS[sym]["dk"]), iv, dk.OFFER_SIDE_BID, start, end))
 
 
-def fetch_tradingview() -> pd.DataFrame:
-    """Unofficial (tvdatafeed). TradingView ka FXCM data = chart jaisa volume.
-    Naive time runner ke local time mein aata hai (GitHub runner = UTC)."""
+def fetch_tradingview(sym: str) -> pd.DataFrame:
+    """Unofficial (tvdatafeed). Naive time runner ke local time mein aata hai (GitHub runner = UTC)."""
     from tvDatafeed import Interval, TvDatafeed
 
     iv = {"5m": Interval.in_5_minute, "15m": Interval.in_15_minute, "30m": Interval.in_30_minute}[INTERVAL]
     bars = int(LOOKBACK_DAYS * 24 * 60 / STEP_MIN)
-    df = TvDatafeed().get_hist(TV_SYMBOL, TV_EXCHANGE, iv, n_bars=min(bars, 5000))
+    tv_sym, tv_ex = PAIRS[sym]["tv"]
+    df = TvDatafeed().get_hist(tv_sym, tv_ex, iv, n_bars=min(bars, 5000))
     if df is None or df.empty:
-        sys.exit("TradingView se data nahi mila")
+        raise RuntimeError("TradingView se data nahi mila")
     return _norm(df)
 
 
-def fetch() -> pd.DataFrame:
-    df = fetch_tradingview() if DATA_SOURCE == "tradingview" else fetch_dukascopy()
+def fetch(sym: str) -> pd.DataFrame:
+    df = fetch_tradingview(sym) if DATA_SOURCE == "tradingview" else fetch_dukascopy(sym)
     if df.empty:
-        sys.exit("Data nahi mila")
+        raise RuntimeError("Data nahi mila")
     if df["Volume"].sum() == 0:
-        sys.exit("Volume zero hai - is data source se indicator nahi chalega")
+        raise RuntimeError("Volume zero hai - is data source se indicator nahi chalega")
     return df
 
 
@@ -158,35 +164,36 @@ def loc(ts: pd.Timestamp) -> str:
     return ts.tz_convert(TZ).strftime("%a %d %b %H:%M %Z")
 
 
-def zone(o) -> str:
-    return f"{o['btm']:.{DEC}f} - {o['top']:.{DEC}f} (avg {o['avg']:.{DEC}f})"
+def zone(o, dec) -> str:
+    return f"{o['btm']:.{dec}f} - {o['top']:.{dec}f} (avg {o['avg']:.{dec}f})"
 
 
-def active_summary(bull, bear) -> str:
+def active_summary(bull, bear, dec) -> str:
     lines = ["", "Abhi chart par active boxes:"]
     for name, obs in (("EXIT (bear)", bear), ("ENTRY (bull)", bull)):
         if not obs:
             lines.append(f"  {name}: koi nahi")
         for o in obs[:EXT_LAST]:
-            lines.append(f"  {name}: {zone(o)} | candle {loc(o['left'])}")
+            lines.append(f"  {name}: {zone(o, dec)} | candle {loc(o['left'])}")
     return "\n".join(lines)
 
 
-def fmt(ev, bull, bear) -> str:
+def fmt(ev, bull, bear, sym) -> str:
     confirm = ev["time"] + STEP  # signal candle ka close = alert ka asli time
-    head = f"{LABEL} {INTERVAL}"
+    head = f"{sym} {INTERVAL}"
+    dec = PAIRS[sym]["dec"]
     if ev["type"] in ("ENTRY", "EXIT"):
         icon, name = ("🟢", "ENTRY (bullish OB)") if ev["type"] == "ENTRY" else ("🟠", "EXIT (bearish OB)")
         o = ev["ob"]
         body = (f"{icon} UNKOWN BADSHA: {name} | {head}\n\n"
                 f"Chart par label/box candle: {loc(o['left'])}\n"
                 f"Signal confirm hua (candle close): {loc(confirm)}\n"
-                f"Zone: {zone(o)}")
+                f"Zone: {zone(o, dec)}")
     else:
         side = "Bullish" if ev["type"] == "BULL_MITIGATED" else "Bearish"
         body = (f"⚪ {side} order block mitigated | {head}\n\n"
                 f"Time (candle close): {loc(confirm)}")
-    return body + "\n" + active_summary(bull, bear)
+    return body + "\n" + active_summary(bull, bear, dec)
 
 
 # ---- Email -------------------------------------------------------------------
@@ -211,42 +218,62 @@ def send(text: str):
 
 
 # ---- Main --------------------------------------------------------------------
-def check(n: int):
-    df = fetch()
-    events, bull, bear = compute(df)
-    print(f"Source={DATA_SOURCE} | {LABEL} {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
-    print(f"Pichle {n} events (naye neeche):")
-    for e in events[-n:]:
-        o = e["ob"]
-        extra = f" | candle {loc(o['left'])} | {zone(o)}" if o else ""
-        print(f"  {e['type']:<15} confirm {loc(e['time'] + STEP)}{extra}")
-    print(active_summary(bull, bear))
+def check(n: int, only=None):
+    for sym in ([only] if only else SYMBOLS):
+        print("=" * 60)
+        try:
+            df = fetch(sym)
+        except Exception as e:
+            print(f"{sym}: ERROR {e}")
+            continue
+        events, bull, bear = compute(df)
+        dec = PAIRS[sym]["dec"]
+        print(f"{sym} | Source={DATA_SOURCE} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
+        print(f"Pichle {n} events (naye neeche):")
+        for e in events[-n:]:
+            o = e["ob"]
+            extra = f" | candle {loc(o['left'])} | {zone(o, dec)}" if o else ""
+            print(f"  {e['type']:<15} confirm {loc(e['time'] + STEP)}{extra}")
+        print(active_summary(bull, bear, dec))
+
+
+def load_state() -> dict:
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    if "last_time" in state:                      # purana single-symbol format
+        state = {"EURUSD": state["last_time"]}
+    return state
 
 
 def main():
-    df = fetch()
-    events, bull, bear = compute(df)
+    state = load_state()
+    for sym in SYMBOLS:
+        try:
+            df = fetch(sym)
+            events, bull, bear = compute(df)
+        except Exception as e:                    # ek symbol fail ho to baaki chalte rahein
+            print(f"{sym}: ERROR {e}")
+            continue
 
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    last_seen = pd.Timestamp(state["last_time"]) if "last_time" in state else None
-    last_bar = df.index[-1]
+        last_bar = df.index[-1]
+        last_seen = pd.Timestamp(state[sym]) if sym in state else None
+        if last_seen is None:
+            new = [e for e in events if e["time"] == last_bar]   # pehli run: spam nahi
+        else:
+            new = [e for e in events if e["time"] > last_seen]   # miss hue bars bhi
 
-    if last_seen is None:
-        new = [e for e in events if e["time"] == last_bar]   # pehli run: spam nahi
-    else:
-        new = [e for e in events if e["time"] > last_seen]   # miss hue bars bhi
+        for e in new:
+            send(fmt(e, bull, bear, sym))
+        if not new:
+            print(f"{sym}: koi naya signal nahi | last closed bar open {loc(last_bar)} | "
+                  f"active bull={len(bull)} bear={len(bear)}")
+        state[sym] = last_bar.isoformat()
 
-    for e in new:
-        send(fmt(e, bull, bear))
-    if not new:
-        print(f"Koi naya signal nahi | last closed bar open {loc(last_bar)} | "
-              f"active bull={len(bull)} bear={len(bear)}")
-
-    STATE_FILE.write_text(json.dumps({"last_time": last_bar.isoformat()}))
+    STATE_FILE.write_text(json.dumps(state, indent=1))
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "check":
-        check(int(sys.argv[2]) if len(sys.argv) > 2 else 10)
+        check(int(sys.argv[2]) if len(sys.argv) > 2 else 10,
+              sys.argv[3].upper() if len(sys.argv) > 3 and sys.argv[3].upper() != "ALL" else None)
     else:
         main()
