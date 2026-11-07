@@ -30,4 +30,4 @@ jobs:
           DATA_SOURCE: ${{ inputs.source }}
           INTERVAL: 15m
           LABEL: EURUSD
-          TIMEZONE: Asia/Kolkata
+          TIMEZONE: UTC
