@@ -15,8 +15,8 @@ concurrency:
 env:
   DATA_SOURCE: dukascopy    # chart se exact match chahiye to: tradingview
   INTERVAL: 15m
-  LABEL: EURUSD
-  TIMEZONE: UTC
+  SYMBOLS: EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD
+  TIMEZONE: Asia/Kolkata
 
 jobs:
   run:
