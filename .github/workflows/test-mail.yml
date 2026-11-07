@@ -1,0 +1,30 @@
+name: Send test mail
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test mail
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python3 - << 'PY'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+          user = os.environ["EMAIL_USER"]
+          to = os.environ.get("EMAIL_TO") or user
+          msg = EmailMessage()
+          msg["Subject"] = "UNKOWN BADSHA - test mail"
+          msg["From"] = user
+          msg["To"] = to
+          msg.set_content("Test mail OK. Alerts isi email par aayenge.")
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=20) as s:
+              s.login(user, os.environ["EMAIL_PASS"])
+              s.send_message(msg)
+          print("Mail bhej di ->", to)
+          PY
