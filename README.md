@@ -1,4 +1,4 @@
-# UNKOWN BADSHA - Python + GitHub Actions (EURUSD 15m)
+# UNKOWN BADSHA - Python + GitHub Actions (EURUSD, GBPUSD, USDJPY, BTCUSD, ETHUSD - 15m)
 
 TradingView Pine v5 "Volume Order Blocks" indicator ka Python port.
 - **ENTRY** = bullish OB, **EXIT** = bearish OB, plus mitigation alerts
@@ -28,3 +28,7 @@ Indicator volume pivot par chalta hai, isliye volume wala source zaroori hai (Ya
 ## Limits
 - Actions cron minimum 5 min, runs late ho sakte hain
 - Private repo mein free minutes jaldi khatam hote hain; public repo unlimited
+
+## Symbols
+`run.yml` mein `SYMBOLS: EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD`. Kam karne ke liye list se naam hata do.
+Naya symbol jodne ke liye `indicator.py` ke `PAIRS` mein entry add karo. State har symbol ka alag `state.json` mein rehta hai.
