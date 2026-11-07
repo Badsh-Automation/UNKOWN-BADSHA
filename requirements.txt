@@ -1,5 +1,0 @@
-numpy
-pandas
-requests
-tzdata
-dukascopy-python==4.0.1
