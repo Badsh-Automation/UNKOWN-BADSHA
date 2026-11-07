@@ -9,6 +9,11 @@ on:
         type: choice
         options: [dukascopy, tradingview]
         default: dukascopy
+      symbol:
+        description: "Symbol"
+        type: choice
+        options: [ALL, EURUSD, GBPUSD, USDJPY, BTCUSD, ETHUSD]
+        default: ALL
       count:
         description: "Kitne last events"
         default: "10"
@@ -25,9 +30,8 @@ jobs:
       - run: pip install -r requirements.txt
       - if: inputs.source == 'tradingview'
         run: pip install git+https://github.com/rongardF/tvdatafeed.git
-      - run: python indicator.py check ${{ inputs.count }}
+      - run: python indicator.py check ${{ inputs.count }} ${{ inputs.symbol }}
         env:
           DATA_SOURCE: ${{ inputs.source }}
           INTERVAL: 15m
-          LABEL: EURUSD
-          TIMEZONE: UTC
+          TIMEZONE: Asia/Kolkata
