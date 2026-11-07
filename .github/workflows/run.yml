@@ -17,6 +17,7 @@ env:
   INTERVAL: 15m
   SYMBOLS: EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD
   TIMEZONE: Asia/Kolkata
+  SEND_MITIGATED: "0"      # sirf ENTRY/EXIT mail
 
 jobs:
   run:
