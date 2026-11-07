@@ -33,8 +33,8 @@ PAIRS = {
     "EURUSD": dict(dk="INSTRUMENT_FX_MAJORS_EUR_USD", tv=("EURUSD", "FXCM"), dec=5),
     "GBPUSD": dict(dk="INSTRUMENT_FX_MAJORS_GBP_USD", tv=("GBPUSD", "FXCM"), dec=5),
     "USDJPY": dict(dk="INSTRUMENT_FX_MAJORS_USD_JPY", tv=("USDJPY", "FXCM"), dec=3),
-    "BTCUSD": dict(dk="INSTRUMENT_VCCY_BTC_USD", tv=("BTCUSD", "BITSTAMP"), dec=2),
-    "ETHUSD": dict(dk="INSTRUMENT_VCCY_ETH_USD", tv=("ETHUSD", "BITSTAMP"), dec=2),
+    "BTCUSD": dict(dk="INSTRUMENT_VCCY_BTC_USD", tv=("BTCUSD", "BITSTAMP"), dec=2, bs="btcusd"),
+    "ETHUSD": dict(dk="INSTRUMENT_VCCY_ETH_USD", tv=("ETHUSD", "BITSTAMP"), dec=2, bs="ethusd"),
 }
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -42,6 +42,8 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO") or EMAIL_USER
+CRYPTO_SOURCE = os.getenv("CRYPTO_SOURCE", "bitstamp")   # bitstamp | dukascopy (BTC/ETH ke liye)
+SEND_MITIGATED = os.getenv("SEND_MITIGATED", "0") == "1"  # 0 = sirf ENTRY/EXIT mail (default), 1 = mitigation bhi
 STATE_FILE = Path(__file__).parent / "state.json"
 
 STEP_MIN = {"5m": 5, "15m": 15, "30m": 30}[INTERVAL]
@@ -150,8 +152,38 @@ def fetch_tradingview(sym: str) -> pd.DataFrame:
     return _norm(df)
 
 
+def fetch_bitstamp(sym: str) -> pd.DataFrame:
+    """Bitstamp ka official public OHLC (TradingView ke BITSTAMP chart wala hi data, volume bhi wahi)."""
+    need = int(LOOKBACK_DAYS * 24 * 60 / STEP_MIN)
+    rows, end = [], None
+    while len(rows) < need:
+        params = {"step": STEP_MIN * 60, "limit": 1000}
+        if end:
+            params["end"] = end
+        r = requests.get(f"https://www.bitstamp.net/api/v2/ohlc/{PAIRS[sym]['bs']}/", params=params, timeout=20)
+        r.raise_for_status()
+        part = r.json()["data"]["ohlc"]
+        if not part:
+            break
+        rows = part + rows
+        end = int(part[0]["timestamp"]) - 1
+        if len(part) < 1000:
+            break
+    if not rows:
+        raise RuntimeError("Bitstamp se data nahi mila")
+    df = pd.DataFrame(rows)
+    df.index = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    return _norm(df)
+
+
 def fetch(sym: str) -> pd.DataFrame:
-    df = fetch_tradingview(sym) if DATA_SOURCE == "tradingview" else fetch_dukascopy(sym)
+    if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp":
+        df = fetch_bitstamp(sym)
+    elif DATA_SOURCE == "tradingview":
+        df = fetch_tradingview(sym)
+    else:
+        df = fetch_dukascopy(sym)
     if df.empty:
         raise RuntimeError("Data nahi mila")
     if df["Volume"].sum() == 0:
@@ -228,7 +260,7 @@ def check(n: int, only=None):
             continue
         events, bull, bear = compute(df)
         dec = PAIRS[sym]["dec"]
-        print(f"{sym} | Source={DATA_SOURCE} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
+        print(f"{sym} | Source={"bitstamp" if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp" else DATA_SOURCE} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
         print(f"Pichle {n} events (naye neeche):")
         for e in events[-n:]:
             o = e["ob"]
@@ -261,6 +293,8 @@ def main():
         else:
             new = [e for e in events if e["time"] > last_seen]   # miss hue bars bhi
 
+        if not SEND_MITIGATED:
+            new = [e for e in new if e["type"] in ("ENTRY", "EXIT")]
         for e in new:
             send(fmt(e, bull, bear, sym))
         if not new:
