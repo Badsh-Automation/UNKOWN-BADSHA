@@ -260,7 +260,8 @@ def check(n: int, only=None):
             continue
         events, bull, bear = compute(df)
         dec = PAIRS[sym]["dec"]
-        print(f"{sym} | Source={"bitstamp" if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp" else DATA_SOURCE} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
+        src = "bitstamp" if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp" else DATA_SOURCE
+        print(f"{sym} | Source={src} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
         print(f"Pichle {n} events (naye neeche):")
         for e in events[-n:]:
             o = e["ob"]
