@@ -43,6 +43,7 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO") or EMAIL_USER
 CRYPTO_SOURCE = os.getenv("CRYPTO_SOURCE", "bitstamp")   # bitstamp | dukascopy (BTC/ETH ke liye)
+SKIP_INVALID = os.getenv("SKIP_INVALID", "1") == "1"      # 1 = jo box mail bhejte waqt tak toot chuka ho, uska alert nahi
 SEND_MITIGATED = os.getenv("SEND_MITIGATED", "0") == "1"  # 0 = sirf ENTRY/EXIT mail (default), 1 = mitigation bhi
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")   # phone push (ntfy app)
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -226,7 +227,9 @@ def fmt(ev, bull, bear, sym) -> str:
         side = "Bullish" if ev["type"] == "BULL_MITIGATED" else "Bearish"
         body = (f"⚪ {side} order block mitigated | {head}\n\n"
                 f"Time (candle close): {loc(confirm)}")
-    return body + "\n" + active_summary(bull, bear, dec)
+    late = int((pd.Timestamp.now(tz="UTC") - confirm).total_seconds() // 60)
+    sent = f"Mail bheji gayi: {loc(pd.Timestamp.now(tz='UTC'))} (candle close ke {max(late, 0)} min baad)"
+    return body + "\n" + sent + "\n" + active_summary(bull, bear, dec)
 
 
 # ---- Email -------------------------------------------------------------------
@@ -317,6 +320,15 @@ def main():
 
         if not SEND_MITIGATED:
             new = [e for e in new if e["type"] in ("ENTRY", "EXIT")]
+        if SKIP_INVALID:
+            def alive(e):
+                active = bull if e["type"] == "ENTRY" else bear
+                return any(e["ob"] is o for o in active)
+            valid = [e for e in new if e["type"] not in ("ENTRY", "EXIT") or alive(e)]
+            for e in new:
+                if e not in valid:
+                    print(f"{sym}: {e['type']} (candle {loc(e['ob']['left'])}) skip - box pehle hi mitigate ho chuka")
+            new = valid
         for e in new:
             send(fmt(e, bull, bear, sym))
         if not new:
