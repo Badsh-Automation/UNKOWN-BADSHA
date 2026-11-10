@@ -1,4 +1,4 @@
-"""UNKOWN BADSHA - Volume Order Block indicator (Pine v5 -> Python), EURUSD 15m.
+"""UNKOWN BADSHA - Smart Volume Confirmed OB indicator (Pine v5 -> Python), EURUSD 15m.
 
 Run modes:
   python indicator.py                  -> sab symbols ke naye signals email karo (state.json se duplicate roke)
@@ -23,10 +23,23 @@ DATA_SOURCE = os.getenv("DATA_SOURCE", "dukascopy")   # dukascopy | tradingview
 SYMBOLS = [x.strip().upper() for x in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD").split(",") if x.strip()]
 INTERVAL = os.getenv("INTERVAL", "15m")               # 5m | 15m | 30m
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "15"))
-LENGTH = int(os.getenv("LENGTH", "5"))                # Volume Pivot Length
+LENGTH = int(os.getenv("LENGTH", "3"))                # Volume Pivot Length
 MITIGATION = os.getenv("MITIGATION", "Wick")          # Wick | Close
-EXT_LAST = int(os.getenv("EXT_LAST", "3"))            # chart par kitne box dikhte hain
+EXT_LAST = int(os.getenv("EXT_LAST", "3"))            # chart par kitne box dikhte hain (bull 3 / bear 3)
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))  # mail ka time is timezone mein
+
+# ---- Smart Volume settings (Pine inputs, screenshot wali values default) ----
+MIN_STRENGTH = os.getenv("MIN_STRENGTH", "High")                   # High | Extreme
+SHOW_WEAK = os.getenv("SHOW_WEAK", "0") == "1"                     # Show Weak Volume OB
+VOL_LEN = int(os.getenv("VOL_LEN", "20"))                          # Volume Average Length
+USE_LEGACY = os.getenv("USE_LEGACY", "1") == "1"                   # Legacy Multipliers (2.0 / 2.5)
+HIGH_FACTOR = float(os.getenv("HIGH_FACTOR", "1.5"))
+EXTREME_FACTOR = float(os.getenv("EXTREME_FACTOR", "2.5"))
+DETECT_MODE = os.getenv("DETECT_MODE", "RVOL only")                # RVOL only | RVOL + Z-Score
+Z_HIGH = float(os.getenv("Z_HIGH", "1"))
+Z_EXTREME = float(os.getenv("Z_EXTREME", "2"))
+USE_PCT = os.getenv("USE_PCT", "0") == "1"                         # Percentile Filter
+PCT_MIN = float(os.getenv("PCT_MIN", "90"))
 
 # Har symbol: Dukascopy instrument, TradingView (symbol, exchange), price decimals
 PAIRS = {
@@ -64,11 +77,42 @@ def pivot_high(vol: np.ndarray, length: int) -> np.ndarray:
     return out
 
 
+def volume_flags(v: np.ndarray):
+    """Smart Volume Engine: har bar ke liye (isHigh, isExtreme) - Pine section 5 jaisa."""
+    n = len(v)
+    s = pd.Series(v)
+    ma = s.rolling(VOL_LEN).mean().to_numpy()
+    std = s.rolling(VOL_LEN).std(ddof=0).to_numpy()      # ta.stdev = population std
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rvol = np.where(ma > 0, v / ma, 0.0)
+        z = np.where(std > 0, (v - ma) / std, 0.0)
+
+    # ta.percentrank: pichhle VOL_LEN bars mein kitne % <= current
+    pct = np.full(n, np.nan)
+    for i in range(VOL_LEN, n):
+        prev = v[i - VOL_LEN : i]
+        pct[i] = (prev <= v[i]).sum() / VOL_LEN * 100.0
+    pct_ok = np.ones(n, bool) if not USE_PCT else (np.nan_to_num(pct, nan=-1) >= PCT_MIN)
+
+    hi_mult = 2.0 if USE_LEGACY else HIGH_FACTOR
+    ex_mult = 2.5 if USE_LEGACY else max(EXTREME_FACTOR, HIGH_FACTOR)
+
+    rvol_only = DETECT_MODE == "RVOL only"
+    hi_cond = (rvol > hi_mult) & (np.ones(n, bool) if rvol_only else (z >= Z_HIGH)) & pct_ok
+    ex_cond = (rvol > ex_mult) & (np.ones(n, bool) if rvol_only else (z >= Z_EXTREME)) & pct_ok
+
+    data_ok = (np.arange(n) >= VOL_LEN) & (v > 0)
+    is_high = data_ok & (hi_cond | ex_cond)
+    is_extreme = data_ok & ex_cond
+    return is_high, is_extreme
+
+
 def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION):
     h = df["High"].to_numpy(float)
     l = df["Low"].to_numpy(float)
     c = df["Close"].to_numpy(float)
-    v = df["Volume"].to_numpy(float)
+    v = np.nan_to_num(df["Volume"].to_numpy(float))
     t = df.index
     n = len(df)
     hl2 = (h + l) / 2
@@ -83,6 +127,10 @@ def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION
 
     phv = pivot_high(v, length)
 
+    # OB candle (bar i-length) ka volume strong hona chahiye (isHigh[length] / isExtreme[length])
+    is_high, is_extreme = volume_flags(v)
+    strong_arr = is_high if MIN_STRENGTH == "High" else is_extreme
+
     os_state = 0
     bull_obs, bear_obs = [], []   # newest pehle (Pine ke array.unshift jaisa)
     events = []
@@ -96,14 +144,16 @@ def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION
 
         if not np.isnan(phv[i]):
             j = i - length
-            if os_state == 1:
-                ob = dict(top=hl2[j], btm=l[j], avg=(hl2[j] + l[j]) / 2, left=t[j])
-                bull_obs.insert(0, ob)
-                events.append(dict(time=t[i], type="ENTRY", ob=ob))
-            else:
-                ob = dict(top=h[j], btm=hl2[j], avg=(h[j] + hl2[j]) / 2, left=t[j])
-                bear_obs.insert(0, ob)
-                events.append(dict(time=t[i], type="EXIT", ob=ob))
+            approved = bool(strong_arr[j]) or SHOW_WEAK
+            if approved:
+                if os_state == 1:
+                    ob = dict(top=hl2[j], btm=l[j], avg=(hl2[j] + l[j]) / 2, left=t[j])
+                    bull_obs.insert(0, ob)
+                    events.append(dict(time=t[i], type="ENTRY", ob=ob))
+                else:
+                    ob = dict(top=h[j], btm=hl2[j], avg=(h[j] + hl2[j]) / 2, left=t[j])
+                    bear_obs.insert(0, ob)
+                    events.append(dict(time=t[i], type="EXIT", ob=ob))
 
         if not np.isnan(tgt_bull[i]):
             keep = [o for o in bull_obs if not tgt_bull[i] < o["btm"]]
