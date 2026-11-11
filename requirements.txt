@@ -3,5 +3,4 @@ pandas
 requests
 tzdata
 dukascopy-python==4.0.1
-pip install --upgrade pip
 git+https://github.com/rongardF/tvdatafeed.git
