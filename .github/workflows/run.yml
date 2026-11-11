@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DATA_SOURCE: dukascopy    # chart se exact match chahiye to: tradingview
+  DATA_SOURCE: tradingview    # chart se exact match chahiye to: tradingview
   INTERVAL: 15m
   SYMBOLS: EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD
   TIMEZONE: Asia/Kolkata
