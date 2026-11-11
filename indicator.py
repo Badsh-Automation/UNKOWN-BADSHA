@@ -1,7 +1,12 @@
-"""UNKOWN BADSHA - Smart Volume Confirmed OB indicator (Pine v5 -> Python), EURUSD 15m.
+"""UNKOWN BADSHA - Volume Order Block indicator (Pine v5 -> Python), 15m.
+
+Data source:
+  EURUSD / GBPUSD / USDJPY -> TradingView (tvDatafeed, bina login, exchange "FX"), last 20 din
+  BTCUSD / ETHUSD          -> Bitstamp (pehle jaisa)
+  Koi silent fallback nahi: TradingView fail ho to error print hoga aur wo symbol skip hoga.
 
 Run modes:
-  python indicator.py                  -> sab symbols ke naye signals email karo (state.json se duplicate roke)
+  python indicator.py                  -> sab symbols ke naye signals email/push karo (state.json se duplicate roke)
   python indicator.py check 10 [SYM]   -> last 10 signals + active boxes print karo (chart se match karne ke liye)
 """
 import json
@@ -9,6 +14,7 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -19,33 +25,22 @@ import pandas as pd
 import requests
 
 # ---- Settings (env se override) ---------------------------------------------
-DATA_SOURCE = os.getenv("DATA_SOURCE", "dukascopy")   # dukascopy | tradingview
+DATA_SOURCE = os.getenv("DATA_SOURCE", "tradingview")  # tradingview | dukascopy (dukascopy sirf jab tum khud env se set karo)
 SYMBOLS = [x.strip().upper() for x in os.getenv("SYMBOLS", "EURUSD,GBPUSD,USDJPY,BTCUSD,ETHUSD").split(",") if x.strip()]
 INTERVAL = os.getenv("INTERVAL", "15m")               # 5m | 15m | 30m
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "15"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "20"))
 LENGTH = int(os.getenv("LENGTH", "3"))                # Volume Pivot Length
 MITIGATION = os.getenv("MITIGATION", "Wick")          # Wick | Close
-EXT_LAST = int(os.getenv("EXT_LAST", "3"))            # chart par kitne box dikhte hain (bull 3 / bear 3)
+EXT_LAST = int(os.getenv("EXT_LAST", "3"))            # chart par kitne box dikhte hain
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))  # mail ka time is timezone mein
-
-# ---- Smart Volume settings (Pine inputs, screenshot wali values default) ----
-MIN_STRENGTH = os.getenv("MIN_STRENGTH", "High")                   # High | Extreme
-SHOW_WEAK = os.getenv("SHOW_WEAK", "0") == "1"                     # Show Weak Volume OB
-VOL_LEN = int(os.getenv("VOL_LEN", "20"))                          # Volume Average Length
-USE_LEGACY = os.getenv("USE_LEGACY", "1") == "1"                   # Legacy Multipliers (2.0 / 2.5)
-HIGH_FACTOR = float(os.getenv("HIGH_FACTOR", "1.5"))
-EXTREME_FACTOR = float(os.getenv("EXTREME_FACTOR", "2.5"))
-DETECT_MODE = os.getenv("DETECT_MODE", "RVOL only")                # RVOL only | RVOL + Z-Score
-Z_HIGH = float(os.getenv("Z_HIGH", "1"))
-Z_EXTREME = float(os.getenv("Z_EXTREME", "2"))
-USE_PCT = os.getenv("USE_PCT", "0") == "1"                         # Percentile Filter
-PCT_MIN = float(os.getenv("PCT_MIN", "90"))
+TV_BARS = int(os.getenv("TV_BARS", "2000"))           # TradingView se itne bars mangao, phir LOOKBACK_DAYS par trim
+TV_RETRIES = int(os.getenv("TV_RETRIES", "3"))
 
 # Har symbol: Dukascopy instrument, TradingView (symbol, exchange), price decimals
 PAIRS = {
-    "EURUSD": dict(dk="INSTRUMENT_FX_MAJORS_EUR_USD", tv=("EURUSD", "FXCM"), dec=5),
-    "GBPUSD": dict(dk="INSTRUMENT_FX_MAJORS_GBP_USD", tv=("GBPUSD", "FXCM"), dec=5),
-    "USDJPY": dict(dk="INSTRUMENT_FX_MAJORS_USD_JPY", tv=("USDJPY", "FXCM"), dec=3),
+    "EURUSD": dict(dk="INSTRUMENT_FX_MAJORS_EUR_USD", tv=("EURUSD", "FX"), dec=5),
+    "GBPUSD": dict(dk="INSTRUMENT_FX_MAJORS_GBP_USD", tv=("GBPUSD", "FX"), dec=5),
+    "USDJPY": dict(dk="INSTRUMENT_FX_MAJORS_USD_JPY", tv=("USDJPY", "FX"), dec=3),
     "BTCUSD": dict(dk="INSTRUMENT_VCCY_BTC_USD", tv=("BTCUSD", "BITSTAMP"), dec=2, bs="btcusd"),
     "ETHUSD": dict(dk="INSTRUMENT_VCCY_ETH_USD", tv=("ETHUSD", "BITSTAMP"), dec=2, bs="ethusd"),
 }
@@ -77,42 +72,11 @@ def pivot_high(vol: np.ndarray, length: int) -> np.ndarray:
     return out
 
 
-def volume_flags(v: np.ndarray):
-    """Smart Volume Engine: har bar ke liye (isHigh, isExtreme) - Pine section 5 jaisa."""
-    n = len(v)
-    s = pd.Series(v)
-    ma = s.rolling(VOL_LEN).mean().to_numpy()
-    std = s.rolling(VOL_LEN).std(ddof=0).to_numpy()      # ta.stdev = population std
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rvol = np.where(ma > 0, v / ma, 0.0)
-        z = np.where(std > 0, (v - ma) / std, 0.0)
-
-    # ta.percentrank: pichhle VOL_LEN bars mein kitne % <= current
-    pct = np.full(n, np.nan)
-    for i in range(VOL_LEN, n):
-        prev = v[i - VOL_LEN : i]
-        pct[i] = (prev <= v[i]).sum() / VOL_LEN * 100.0
-    pct_ok = np.ones(n, bool) if not USE_PCT else (np.nan_to_num(pct, nan=-1) >= PCT_MIN)
-
-    hi_mult = 2.0 if USE_LEGACY else HIGH_FACTOR
-    ex_mult = 2.5 if USE_LEGACY else max(EXTREME_FACTOR, HIGH_FACTOR)
-
-    rvol_only = DETECT_MODE == "RVOL only"
-    hi_cond = (rvol > hi_mult) & (np.ones(n, bool) if rvol_only else (z >= Z_HIGH)) & pct_ok
-    ex_cond = (rvol > ex_mult) & (np.ones(n, bool) if rvol_only else (z >= Z_EXTREME)) & pct_ok
-
-    data_ok = (np.arange(n) >= VOL_LEN) & (v > 0)
-    is_high = data_ok & (hi_cond | ex_cond)
-    is_extreme = data_ok & ex_cond
-    return is_high, is_extreme
-
-
 def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION):
     h = df["High"].to_numpy(float)
     l = df["Low"].to_numpy(float)
     c = df["Close"].to_numpy(float)
-    v = np.nan_to_num(df["Volume"].to_numpy(float))
+    v = df["Volume"].to_numpy(float)
     t = df.index
     n = len(df)
     hl2 = (h + l) / 2
@@ -127,10 +91,6 @@ def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION
 
     phv = pivot_high(v, length)
 
-    # OB candle (bar i-length) ka volume strong hona chahiye (isHigh[length] / isExtreme[length])
-    is_high, is_extreme = volume_flags(v)
-    strong_arr = is_high if MIN_STRENGTH == "High" else is_extreme
-
     os_state = 0
     bull_obs, bear_obs = [], []   # newest pehle (Pine ke array.unshift jaisa)
     events = []
@@ -144,16 +104,14 @@ def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION
 
         if not np.isnan(phv[i]):
             j = i - length
-            approved = bool(strong_arr[j]) or SHOW_WEAK
-            if approved:
-                if os_state == 1:
-                    ob = dict(top=hl2[j], btm=l[j], avg=(hl2[j] + l[j]) / 2, left=t[j])
-                    bull_obs.insert(0, ob)
-                    events.append(dict(time=t[i], type="ENTRY", ob=ob))
-                else:
-                    ob = dict(top=h[j], btm=hl2[j], avg=(h[j] + hl2[j]) / 2, left=t[j])
-                    bear_obs.insert(0, ob)
-                    events.append(dict(time=t[i], type="EXIT", ob=ob))
+            if os_state == 1:
+                ob = dict(top=hl2[j], btm=l[j], avg=(hl2[j] + l[j]) / 2, left=t[j])
+                bull_obs.insert(0, ob)
+                events.append(dict(time=t[i], type="ENTRY", ob=ob))
+            else:
+                ob = dict(top=h[j], btm=hl2[j], avg=(h[j] + hl2[j]) / 2, left=t[j])
+                bear_obs.insert(0, ob)
+                events.append(dict(time=t[i], type="EXIT", ob=ob))
 
         if not np.isnan(tgt_bull[i]):
             keep = [o for o in bull_obs if not tgt_bull[i] < o["btm"]]
@@ -172,6 +130,8 @@ def compute(df: pd.DataFrame, length: int = LENGTH, mitigation: str = MITIGATION
 # ---- Data sources ------------------------------------------------------------
 def _norm(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=str.capitalize)[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if df.empty:
+        raise RuntimeError("Data khaali hai (dropna ke baad)")
     idx = pd.to_datetime(df.index)
     df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
     df = df[~df.index.duplicated(keep="last")].sort_index()
@@ -182,6 +142,7 @@ def _norm(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_dukascopy(sym: str) -> pd.DataFrame:
+    """Sirf tab chalega jab DATA_SOURCE=dukascopy khud set karo. Default mein use nahi hota."""
     import dukascopy_python as dk
     from dukascopy_python import instruments as ins
 
@@ -192,16 +153,38 @@ def fetch_dukascopy(sym: str) -> pd.DataFrame:
 
 
 def fetch_tradingview(sym: str) -> pd.DataFrame:
-    """Unofficial (tvdatafeed). Naive time runner ke local time mein aata hai (GitHub runner = UTC)."""
+    """TradingView (tvDatafeed, bina login). Exchange FX.
+    tvDatafeed naive time runner ke local timezone mein deta hai, isliye pehle wahi tz lagake UTC banate hain."""
     from tvDatafeed import Interval, TvDatafeed
 
     iv = {"5m": Interval.in_5_minute, "15m": Interval.in_15_minute, "30m": Interval.in_30_minute}[INTERVAL]
-    bars = int(LOOKBACK_DAYS * 24 * 60 / STEP_MIN)
     tv_sym, tv_ex = PAIRS[sym]["tv"]
-    df = TvDatafeed().get_hist(tv_sym, tv_ex, iv, n_bars=min(bars, 5000))
+
+    df, last_err = None, None
+    for attempt in range(1, TV_RETRIES + 1):
+        try:
+            df = TvDatafeed().get_hist(tv_sym, tv_ex, iv, n_bars=TV_BARS)
+            if df is not None and not df.empty:
+                break
+            last_err = "TradingView ne khaali data diya"
+        except Exception as e:
+            last_err = str(e)
+        print(f"{sym}: TradingView try {attempt}/{TV_RETRIES} fail - {last_err}")
+        time.sleep(3 * attempt)
     if df is None or df.empty:
-        raise RuntimeError("TradingView se data nahi mila")
-    return _norm(df)
+        raise RuntimeError(f"TradingView se data nahi mila ({last_err})")
+
+    # naive local time -> aware -> UTC
+    idx = pd.to_datetime(df.index)
+    if idx.tz is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        df.index = idx.tz_localize(local_tz)
+    df = _norm(df)
+
+    # Sirf last LOOKBACK_DAYS din rakho
+    cutoff = df.index[-1] - pd.Timedelta(days=LOOKBACK_DAYS)
+    df = df[df.index >= cutoff]
+    return df
 
 
 def fetch_bitstamp(sym: str) -> pd.DataFrame:
@@ -229,10 +212,17 @@ def fetch_bitstamp(sym: str) -> pd.DataFrame:
     return _norm(df)
 
 
-def fetch(sym: str) -> pd.DataFrame:
+def source_of(sym: str) -> str:
     if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp":
+        return "bitstamp"
+    return DATA_SOURCE
+
+
+def fetch(sym: str) -> pd.DataFrame:
+    src = source_of(sym)
+    if src == "bitstamp":
         df = fetch_bitstamp(sym)
-    elif DATA_SOURCE == "tradingview":
+    elif src == "tradingview":
         df = fetch_tradingview(sym)
     else:
         df = fetch_dukascopy(sym)
@@ -240,6 +230,9 @@ def fetch(sym: str) -> pd.DataFrame:
         raise RuntimeError("Data nahi mila")
     if df["Volume"].sum() == 0:
         raise RuntimeError("Volume zero hai - is data source se indicator nahi chalega")
+    min_bars = 2 * LENGTH + LENGTH + 5
+    if len(df) < min_bars:
+        raise RuntimeError(f"Bahut kam bars ({len(df)}) - indicator ke liye kam se kam {min_bars} chahiye")
     return df
 
 
@@ -334,8 +327,7 @@ def check(n: int, only=None):
             continue
         events, bull, bear = compute(df)
         dec = PAIRS[sym]["dec"]
-        src = "bitstamp" if PAIRS[sym].get("bs") and CRYPTO_SOURCE == "bitstamp" else DATA_SOURCE
-        print(f"{sym} | Source={src} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
+        print(f"{sym} | Source={source_of(sym)} | {INTERVAL} | bars={len(df)} | last closed bar open: {loc(df.index[-1])}\n")
         print(f"Pichle {n} events (naye neeche):")
         for e in events[-n:]:
             o = e["ob"]
@@ -357,7 +349,7 @@ def main():
         try:
             df = fetch(sym)
             events, bull, bear = compute(df)
-        except Exception as e:                    # ek symbol fail ho to baaki chalte rahein
+        except Exception as e:                    # ek symbol fail ho to baaki chalte rahein (koi fallback nahi)
             print(f"{sym}: ERROR {e}")
             continue
 
